@@ -483,6 +483,7 @@ export const settingsSearchEntries: SettingsSearchEntry[] = [
     'settings.video_player_mode.enable_overrides',
     'settings.video_player_mode.overrides',
     'settings.video_player_scroll',
+    'settings.video_player_scroll_mode.title',
     'settings.auto_exit_fullscreen_on_end',
     'settings.group_player_components',
     'settings.group_playback_memory',
