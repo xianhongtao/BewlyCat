@@ -483,7 +483,6 @@ export const settingsSearchEntries: SettingsSearchEntry[] = [
     'settings.video_player_mode.enable_overrides',
     'settings.video_player_mode.overrides',
     'settings.video_player_scroll',
-    'settings.video_player_scroll_mode.title',
     'settings.auto_exit_fullscreen_on_end',
     'settings.group_player_components',
     'settings.group_playback_memory',
@@ -496,6 +495,14 @@ export const settingsSearchEntries: SettingsSearchEntry[] = [
     'settings.show_bewly_widescreen_button',
     'settings.show_video_screenshot_button',
   ]),
+  ...createEntries(playerRoute, [
+    'settings.video_player_scroll_mode.title',
+  ], {
+    keywordKeys: [
+      'settings.video_player_scroll_mode.sending_bar',
+      'settings.video_player_scroll_mode.player_center',
+    ],
+  }),
   ...createEntries(playerRoute, [
     'settings.video_default_player_mode',
   ], { keywordKeys: playerModeOptionKeys }),

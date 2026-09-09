@@ -1115,6 +1115,10 @@ watch(
     Reflect.deleteProperty(record, 'rememberDanmakuState')
     Reflect.deleteProperty(record, 'rememberCaptionState')
 
+    const validVideoPlayerScrollModes: VideoPlayerScrollMode[] = ['sendingBar', 'playerCenter']
+    if (!validVideoPlayerScrollModes.includes(record.videoPlayerScrollMode))
+      record.videoPlayerScrollMode = originalSettings.videoPlayerScrollMode
+
     const validPlayerDefaultStates: PlayerDefaultState[] = ['system', 'remember', 'on', 'off']
     if (!validPlayerDefaultStates.includes(record.defaultDanmakuState))
       record.defaultDanmakuState = originalSettings.defaultDanmakuState
