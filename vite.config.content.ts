@@ -40,4 +40,14 @@ export default defineConfig({
       },
     },
   },
+  // 内容脚本是 IIFE，且与页面不同源。扩散求解打成经典 inline Worker（blob），
+  // Chrome 与 Firefox 的内容脚本才能启动；module worker 在 Firefox 内容脚本里不可靠。
+  worker: {
+    format: 'iife',
+    rollupOptions: {
+      output: {
+        inlineDynamicImports: true,
+      },
+    },
+  },
 })

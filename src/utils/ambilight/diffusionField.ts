@@ -1,9 +1,10 @@
+import { MIN_ALPHA_FOR_COLOR, sampleDiffusionDisplay } from './diffusionSample'
+
 // 非高斯模式把颜色与不透明度保存在同一个预乘 RGBA 场中：
 // 固定视频区域为 alpha=1 的原始画面，外侧按方程求 alpha 与预乘颜色，
 // 输出时再除回非预乘颜色，避免透明淡出时颜色被一起压暗。
 const SOR_OMEGA = 1.7
 const CONVERGENCE_EPSILON = 1e-3
-const MIN_ALPHA_FOR_COLOR = 0.002
 const EDGE_EPSILON = 0.001
 
 export interface DiffusionFieldGeometry {
@@ -36,11 +37,11 @@ function smoothstep(value: number): number {
 /**
  * 环境光的低分辨率扩散场。网格坐标以光晕矩形的宽高归一化，
  * 视频内容矩形在网格中的位置由 DiffusionFieldGeometry 给出。
+ * 迭代求解由专用 Worker 持有本类；主线程只接收复制出的显示场。
  */
 export class AmbilightDiffusionField {
   public readonly width: number
   public readonly height: number
-  public readonly imageData: ImageData
 
   private readonly innerLeft: number
   private readonly innerTop: number
@@ -71,8 +72,7 @@ export class AmbilightDiffusionField {
     this.fixed = new Uint8Array(length)
     this.state = new Float32Array(length * 4)
     this.display = new Float32Array(length * 4)
-    this.imageData = new ImageData(this.width, this.height)
-    this.output = this.imageData.data
+    this.output = new Uint8ClampedArray(length * 4)
 
     for (let y = 0; y < this.height; y++) {
       const cy = y + 0.5
@@ -134,7 +134,7 @@ export class AmbilightDiffusionField {
     force: boolean,
     iterations: number,
     featherCells: number,
-  ): ImageData {
+  ): void {
     if (source.length < this.width * this.height * 4)
       throw new Error('Invalid diffusion source data')
 
@@ -161,7 +161,16 @@ export class AmbilightDiffusionField {
 
     this.writeOutput()
     this.solutionReady = true
-    return this.imageData
+  }
+
+  /** 复制输出像素。内部缓冲留给下一帧，返回值可以转移给主线程。 */
+  public copyOutput(): Uint8ClampedArray {
+    return this.output.slice()
+  }
+
+  /** 复制预乘显示场，供主线程采样文字背景。求解器仍保留原缓冲做帧间混合。 */
+  public copyDisplay(): Float32Array {
+    return new Float32Array(this.display)
   }
 
   /**
@@ -169,31 +178,7 @@ export class AmbilightDiffusionField {
    * 在预乘空间插值后再除回 alpha，返回非预乘颜色的 sRGB 编码亮度与 alpha。
    */
   public sample(u: number, v: number): { luma: number, alpha: number } {
-    const fx = clamp(u * this.width - 0.5, 0, this.width - 1)
-    const fy = clamp(v * this.height - 0.5, 0, this.height - 1)
-    const x0 = Math.floor(fx)
-    const y0 = Math.floor(fy)
-    const x1 = Math.min(this.width - 1, x0 + 1)
-    const y1 = Math.min(this.height - 1, y0 + 1)
-    const tx = fx - x0
-    const ty = fy - y0
-
-    let luma = 0
-    let alpha = 0
-    const accumulate = (x: number, y: number, weight: number) => {
-      const base = (y * this.width + x) * 4
-      luma += weight * (0.2126 * this.display[base] + 0.7152 * this.display[base + 1] + 0.0722 * this.display[base + 2])
-      alpha += weight * this.display[base + 3]
-    }
-    accumulate(x0, y0, (1 - tx) * (1 - ty))
-    accumulate(x1, y0, tx * (1 - ty))
-    accumulate(x0, y1, (1 - tx) * ty)
-    accumulate(x1, y1, tx * ty)
-
-    return {
-      luma: alpha > MIN_ALPHA_FOR_COLOR ? clamp(luma / alpha, 0, 1) : 0,
-      alpha: clamp(alpha, 0, 1),
-    }
+    return sampleDiffusionDisplay(this.display, this.width, this.height, u, v)
   }
 
   private updateFixedPixels(source: Uint8ClampedArray): void {

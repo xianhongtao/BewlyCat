@@ -1,5 +1,7 @@
 import type { DiffusionFieldGeometry } from './diffusionField'
-import { AmbilightDiffusionField } from './diffusionField'
+import type { DiffusionSolveResult } from './diffusionFieldClient'
+import { DiffusionFieldWorkerClient } from './diffusionFieldClient'
+import { sampleDiffusionDisplay } from './diffusionSample'
 import { contentRect, glowGeometry } from './geometry'
 import { blendAlpha, blurredCoverage } from './math'
 import type { AmbilightBackdropAnchor, AmbilightBackdropProbe, AmbilightBackdropSample, AmbilightDiffusionQuality, AmbilightDisplayMode, AmbilightEngineOptions } from './types'
@@ -76,11 +78,16 @@ export class AmbilightEngine {
   private backdropSampleTimer: ReturnType<typeof setTimeout> | null = null
   private backdropProbe: AmbilightBackdropProbe | null
   private backdropAlpha = new Float32Array(BACKDROP_SAMPLE_WIDTH * BACKDROP_SAMPLE_HEIGHT)
-  private diffusionField: AmbilightDiffusionField | null = null
+  private diffusionClient: DiffusionFieldWorkerClient | null = null
   private diffusionLayout: DiffusionLayout | null = null
   private diffusionKey = ''
   private diffusionFallback = false
   private diffusionNeedsReset = true
+  private diffusionHasSolution = false
+  private diffusionPendingForce = false
+  private diffusionDisplay: Float32Array | null = null
+  private diffusionDisplayWidth = 0
+  private diffusionDisplayHeight = 0
   private diffusionIterations = 0
   private sourceCanvas: HTMLCanvasElement | null = null
   private sourceCtx: CanvasRenderingContext2D | null = null
@@ -198,6 +205,8 @@ export class AmbilightEngine {
     if (previousDiffusion !== this.options.diffusion) {
       this.diffusionFallback = false
       this.diffusionIterations = this.getConfiguredIterations()
+      if (this.options.diffusion === 'gaussian')
+        this.releaseDiffusionWorker()
       this.resetDiffusionField()
     }
     else if (previousIterations !== this.options.diffusionIterations) {
@@ -243,6 +252,7 @@ export class AmbilightEngine {
     this.hostDocumentLeft = 0
     this.hostDocumentTop = 0
     this.layoutDirty = true
+    this.releaseDiffusionWorker()
     this.resetDiffusionField()
   }
 
@@ -343,7 +353,7 @@ export class AmbilightEngine {
   }
 
   private onVideoLoadedData = () => {
-    this.diffusionNeedsReset = true
+    this.markDiffusionStale()
     this.invalidate(true)
   }
 
@@ -360,7 +370,7 @@ export class AmbilightEngine {
   }
 
   private onVideoSeeked = () => {
-    this.diffusionNeedsReset = true
+    this.markDiffusionStale()
     this.invalidate(true)
   }
 
@@ -372,7 +382,7 @@ export class AmbilightEngine {
   }
 
   private onVideoMetadataOrResize = () => {
-    this.diffusionNeedsReset = true
+    this.markDiffusionStale()
     this.invalidate(true)
   }
 
@@ -559,9 +569,9 @@ export class AmbilightEngine {
     this.applyCanvasPosition(r, false)
   }
 
-  private drawSingleFrame(force = false, frameTime?: number) {
+  private drawSingleFrame(force = false, frameTime?: number): 'deferred' | 'done' {
     if (!this.video || !this.ctx || this.video.readyState < 2 || !this.video.videoWidth)
-      return
+      return 'done'
 
     const now = frameTime ?? performance.now()
     const dt = this.lastDrawTime ? Math.min(500, now - this.lastDrawTime) : 1000
@@ -569,17 +579,17 @@ export class AmbilightEngine {
 
     if (this.usesDiffusion()) {
       try {
-        if (this.drawDiffusionFrame(force, blend)) {
-          this.hasPainted = true
-          this.hostElem?.classList.remove('is-pending')
+        const status = this.drawDiffusionFrame(force, blend)
+        if (status === 'deferred')
+          return 'deferred'
+        // 绘制发生在 Worker 回传之后；这里只记录采样时刻，避免求解期间继续投递。
+        if (status === 'posted')
           this.lastDrawTime = now
-          this.sampleBackdrop(now, force)
-        }
         // 扩散场暂不可用时跳过本帧：画布此时没有模糊滤镜，不能直接画清晰视频
-        return
+        return 'done'
       }
       catch {
-        // 画布被跨域视频污染或求解异常时，退回现有高斯路径，避免整块环境光消失
+        // 画布被跨域视频污染或 Worker 无法启动时，退回现有高斯路径，避免整块环境光消失
         this.enableDiffusionFallback()
       }
     }
@@ -618,6 +628,7 @@ export class AmbilightEngine {
     catch {
       // 捕获跨域或未就绪异常
     }
+    return 'done'
   }
 
   private usesDiffusion(): boolean {
@@ -633,14 +644,44 @@ export class AmbilightEngine {
   }
 
   private resetDiffusionField(): void {
-    this.diffusionField = null
+    this.diffusionClient?.invalidate()
     this.diffusionLayout = null
     this.diffusionKey = ''
     this.diffusionNeedsReset = true
+    this.diffusionHasSolution = false
+    this.diffusionPendingForce = false
+    this.diffusionDisplay = null
+    this.diffusionDisplayWidth = 0
+    this.diffusionDisplayHeight = 0
+  }
+
+  private markDiffusionStale(): void {
+    this.diffusionNeedsReset = true
+    this.diffusionHasSolution = false
+    this.diffusionClient?.invalidate()
+  }
+
+  private ensureDiffusionClient(): DiffusionFieldWorkerClient {
+    if (!this.diffusionClient) {
+      this.diffusionClient = new DiffusionFieldWorkerClient({
+        onResult: result => this.paintDiffusionResult(result),
+        onFailure: () => this.enableDiffusionFallback(),
+        onSettled: () => this.onDiffusionSettled(),
+      })
+    }
+    return this.diffusionClient
+  }
+
+  private releaseDiffusionWorker(): void {
+    this.diffusionClient?.destroy()
+    this.diffusionClient = null
   }
 
   private enableDiffusionFallback(): void {
+    if (this.diffusionFallback)
+      return
     this.diffusionFallback = true
+    this.releaseDiffusionWorker()
     this.resetDiffusionField()
     this.applyCanvasStyles(this.options.blur)
     // 下一帧按高斯专属参数重新计算布局和模糊。
@@ -771,59 +812,108 @@ export class AmbilightEngine {
     return ctx.getImageData(0, 0, geometry.width, geometry.height)
   }
 
-  private drawDiffusionFrame(force: boolean, blend: number): boolean {
+  private drawDiffusionFrame(force: boolean, blend: number): 'posted' | 'deferred' | 'unavailable' {
     const layout = this.diffusionLayout
     const canvas = this.canvas
     const ctx = this.ctx
     const mode = this.options.diffusion
     if (!layout || !canvas || !ctx || mode === 'gaussian')
-      return false
+      return 'unavailable'
+
+    const client = this.ensureDiffusionClient()
+    if (this.diffusionKey !== layout.key) {
+      client.invalidate()
+      this.diffusionKey = layout.key
+      this.diffusionNeedsReset = true
+      this.diffusionHasSolution = false
+    }
+
+    const effectiveForce = force || this.diffusionPendingForce
+    if (client.isBusy) {
+      if (effectiveForce)
+        this.diffusionPendingForce = true
+      return 'deferred'
+    }
 
     const source = this.prepareDiffusionSource(layout.geometry)
     if (!source)
-      return false
-
-    let field = this.diffusionField
-    if (!field || this.diffusionKey !== layout.key) {
-      field = new AmbilightDiffusionField(layout.geometry)
-      if (!field.hasFixedPixels)
-        return false
-      this.diffusionField = field
-      this.diffusionKey = layout.key
-      this.diffusionNeedsReset = true
-    }
-
-    if (this.diffusionNeedsReset) {
-      field.reset(source.data)
-      this.diffusionNeedsReset = false
-    }
+      return 'unavailable'
 
     const configuredIterations = this.getConfiguredIterations()
-    const iterations = force || !field.hasSolution
+    const iterations = effectiveForce || !this.diffusionHasSolution
       ? Math.max(DIFFUSION_INITIAL_ITERATIONS, configuredIterations)
       : this.diffusionIterations
-    const started = performance.now()
-    const imageData = field.render(
-      source.data,
-      this.getDiffusionDecayLength(layout.geometry),
+    const reset = this.diffusionNeedsReset
+    const posted = client.solve({
+      key: layout.key,
+      geometry: layout.geometry,
+      source: source.data,
+      decayLengthPx: this.getDiffusionDecayLength(layout.geometry),
       blend,
-      force,
+      force: effectiveForce,
+      reset,
       iterations,
-      this.options.diffusionFeather,
-    )
-    const elapsed = performance.now() - started
-    if (elapsed > 8 && this.diffusionIterations > DIFFUSION_MIN_ITERATIONS)
+      featherCells: this.options.diffusionFeather,
+    })
+    if (!posted) {
+      if (effectiveForce)
+        this.diffusionPendingForce = true
+      return 'deferred'
+    }
+
+    this.diffusionNeedsReset = false
+    this.diffusionPendingForce = false
+    return 'posted'
+  }
+
+  private paintDiffusionResult(result: DiffusionSolveResult): void {
+    const canvas = this.canvas
+    const ctx = this.ctx
+    if (!this.usesDiffusion() || !canvas || !ctx || result.key !== this.diffusionKey)
+      return
+    const pixels = result.width * result.height * 4
+    if (result.rgba.length !== pixels || result.display.length !== pixels)
+      return
+
+    try {
+      if (canvas.width !== result.width)
+        canvas.width = result.width
+      if (canvas.height !== result.height)
+        canvas.height = result.height
+      // 结构化克隆把缓冲标成 ArrayBufferLike；Worker 传回的是普通 ArrayBuffer。
+      const rgba = result.rgba as Uint8ClampedArray<ArrayBuffer>
+      ctx.putImageData(new ImageData(rgba, result.width, result.height), 0, 0)
+    }
+    catch {
+      this.enableDiffusionFallback()
+      return
+    }
+
+    this.diffusionDisplay = result.display
+    this.diffusionDisplayWidth = result.width
+    this.diffusionDisplayHeight = result.height
+    this.diffusionHasSolution = true
+
+    const configuredIterations = this.getConfiguredIterations()
+    if (result.elapsed > 8 && this.diffusionIterations > DIFFUSION_MIN_ITERATIONS)
       this.diffusionIterations = Math.max(DIFFUSION_MIN_ITERATIONS, this.diffusionIterations - 2)
-    // 负载回落后逐步恢复到设置值，避免一次卡顿后永久降级
-    else if (elapsed < 4 && this.diffusionIterations < configuredIterations)
+    // 负载回落后逐步恢复到设置值，避免一次求解偏慢后永久降级。依据的是 Worker 求解耗时。
+    else if (result.elapsed < 4 && this.diffusionIterations < configuredIterations)
       this.diffusionIterations++
 
-    if (canvas.width !== field.width)
-      canvas.width = field.width
-    if (canvas.height !== field.height)
-      canvas.height = field.height
-    ctx.putImageData(imageData, 0, 0)
-    return true
+    this.hasPainted = true
+    this.hostElem?.classList.remove('is-pending')
+    this.sampleBackdrop(performance.now(), false)
+  }
+
+  private onDiffusionSettled(): void {
+    if (!this.diffusionPendingForce || !this.usesDiffusion() || !this.isAllowed())
+      return
+    if (this.rafId !== null) {
+      this.needsForceDraw = true
+      return
+    }
+    this.drawSingleFrame(true)
   }
 
   private cancelBackdropSample() {
@@ -859,10 +949,9 @@ export class AmbilightEngine {
     const anchors = this.backdropProbe.getAnchors()
     let samples: AmbilightBackdropSample[] | null
     if (this.usesDiffusion()) {
-      const field = this.diffusionField
-      if (!field?.hasSolution)
+      if (!this.diffusionDisplay)
         return
-      samples = this.sampleDiffusionBackdrop(field, canvasRect, anchors)
+      samples = this.sampleDiffusionBackdrop(canvasRect, anchors)
     }
     else {
       samples = this.sampleGaussianBackdrop(canvasRect, anchors)
@@ -884,17 +973,26 @@ export class AmbilightEngine {
   // 扩散场没有 CSS 模糊，显示的就是场本身：直接在文字位置插值取色，不经缩小读回。
   // 场的光晕铺满视口、贴近视频边缘处变化最剧烈，缩到 16×9 再取邻域会把视频区与远处透明区平均进来
   private sampleDiffusionBackdrop(
-    field: AmbilightDiffusionField,
     canvasRect: DOMRect,
     anchors: readonly AmbilightBackdropAnchor[],
   ): AmbilightBackdropSample[] {
+    const display = this.diffusionDisplay
+    if (!display || this.diffusionDisplayWidth <= 0 || this.diffusionDisplayHeight <= 0)
+      return []
+
     const { brightness, opacity } = this.getStrengthFactors()
     return anchors.map(({ region, x, y }) => {
       const u = (x - canvasRect.left) / canvasRect.width
       const v = (y - canvasRect.top) / canvasRect.height
       if (u < 0 || u > 1 || v < 0 || v > 1)
         return { region, glow: 0, alpha: 0 }
-      const { luma, alpha } = field.sample(u, v)
+      const { luma, alpha } = sampleDiffusionDisplay(
+        display,
+        this.diffusionDisplayWidth,
+        this.diffusionDisplayHeight,
+        u,
+        v,
+      )
       return { region, glow: Math.min(1, brightness * luma), alpha: opacity * alpha }
     })
   }
@@ -996,9 +1094,12 @@ export class AmbilightEngine {
       const force = this.needsForceDraw || !this.hasPainted
       const interval = 1000 / Math.max(8, this.options.fps)
       if (force || now - this.lastDrawTime >= interval) {
-        this.drawSingleFrame(force, now)
-        this.lastDrawTime = now
-        this.needsForceDraw = false
+        const status = this.drawSingleFrame(force, now)
+        // Worker 正忙时不消耗这一帧的节流时间，下一帧再投递。
+        if (status !== 'deferred') {
+          this.lastDrawTime = now
+          this.needsForceDraw = false
+        }
       }
 
       this.rafId = requestAnimationFrame(tick)
